@@ -1,0 +1,200 @@
+"""Feature Confocal Diffusion (FCD) module.
+
+The three inputs are ordered [P3, P4, P5], from fine to coarse.
+The output has P4's spatial resolution.
+
+"""
+
+from typing import Optional, Sequence, Tuple
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+__all__ = ["FCD"]
+
+
+class _Bag(nn.Module):
+    """Fuse one corresponding block from P3, P4, and P5."""
+
+    def forward(
+        self,
+        p3: Tensor,
+        p4: Tensor,
+        p5: Tensor,
+    ) -> Tensor:
+        gate = torch.sigmoid(p4)
+        return gate * p5 + (1.0 - gate) * p3
+
+
+class FCD(nn.Module):
+    """Fuse P3, P4, and P5 into a P4-resolution feature map.
+
+    Args:
+        in_channels: Channel counts (C3, C4, C5).
+        out_channels: Output channels; defaults to C4. Must be divisible
+            by four for the A/B/C/D channel blocks.
+        p3_dilation: Dilation of the stride-2 P3 convolution.
+        align_corners: Setting for bilinear interpolation.
+
+    Input:
+        [p3, p4, p5] with shapes [B,C3,H3,W3],
+        [B,C4,H4,W4], and [B,C5,H5,W5].
+
+    Output:
+        Tensor with shape [B,out_channels,H4,W4].
+    """
+
+    def __init__(
+        self,
+        in_channels: Tuple[int, int, int],
+        out_channels: Optional[int] = None,
+        p3_dilation: int = 2,
+        align_corners: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if len(in_channels) != 3 or any(
+            channels <= 0 for channels in in_channels
+        ):
+            raise ValueError(
+                "in_channels must contain three positive integers"
+            )
+
+        if out_channels is None:
+            out_channels = in_channels[1]
+
+        if out_channels <= 0 or out_channels % 4:
+            raise ValueError(
+                "out_channels must be positive and divisible by four"
+            )
+        if p3_dilation < 1:
+            raise ValueError("p3_dilation must be >= 1")
+
+        self.in_channels = tuple(in_channels)
+        self.out_channels = out_channels
+        self.align_corners = align_corners
+
+        # Align all inputs to the same channel width.
+        self.p3_down = nn.Conv2d(
+            in_channels[0],
+            out_channels,
+            kernel_size=3,
+            stride=2,
+            padding=p3_dilation,
+            dilation=p3_dilation,
+        )
+        self.p4_proj = nn.Conv2d(
+            in_channels[1],
+            out_channels,
+            kernel_size=1,
+        )
+        self.p5_proj = nn.Conv2d(
+            in_channels[2],
+            out_channels,
+            kernel_size=1,
+        )
+
+        self.bag = _Bag()
+        self.tail = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=1,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU()
+
+    def forward(
+        self,
+        features: Sequence[Tensor],
+    ) -> Tensor:
+        if len(features) != 3:
+            raise ValueError("FCD expects [P3, P4, P5]")
+
+        p3, p4, p5 = features
+
+        for name, feature, channels in zip(
+            ("P3", "P4", "P5"),
+            (p3, p4, p5),
+            self.in_channels,
+        ):
+            if not isinstance(feature, Tensor):
+                raise ValueError(f"{name} must be a Tensor")
+            if feature.ndim != 4:
+                raise ValueError(
+                    f"{name} must have four dimensions"
+                )
+            if feature.shape[1] != channels:
+                raise ValueError(
+                    f"{name} must have {channels} channels"
+                )
+
+        if (
+            p3.shape[0] != p4.shape[0]
+            or p4.shape[0] != p5.shape[0]
+        ):
+            raise ValueError(
+                "P3, P4, and P5 must have the same batch size"
+            )
+
+        for axis in (-2, -1):
+            if not (
+                p3.shape[axis]
+                >= p4.shape[axis]
+                >= p5.shape[axis]
+            ):
+                raise ValueError(
+                    "expected P3 spatial size >= P4 >= P5"
+                )
+
+        target_size = p4.shape[-2:]
+
+        p3_aligned = self.p3_down(p3)
+        if p3_aligned.shape[-2:] != target_size:
+            # Handles odd input dimensions.
+            p3_aligned = F.interpolate(
+                p3_aligned,
+                size=target_size,
+                mode="bilinear",
+                align_corners=self.align_corners,
+            )
+
+        p4_skip = self.p4_proj(p4)
+
+        p5_aligned = F.interpolate(
+            self.p5_proj(p5),
+            size=target_size,
+            mode="bilinear",
+            align_corners=self.align_corners,
+        )
+
+        p3_blocks = p3_aligned.chunk(4, dim=1)
+        p4_blocks = p4_skip.chunk(4, dim=1)
+        p5_blocks = p5_aligned.chunk(4, dim=1)
+
+        fused_blocks = [
+            self.bag(block3, block4, block5)
+            for block3, block4, block5 in zip(
+                p3_blocks,
+                p4_blocks,
+                p5_blocks,
+            )
+        ]
+
+        fused = torch.cat(fused_blocks, dim=1)
+        return self.act(
+            self.bn(self.tail(fused) + p4_skip)
+        )
+
+
+if __name__ == "__main__":
+    p3 = torch.randn(1, 64, 80, 80)
+    p4 = torch.randn(1, 128, 40, 40)
+    p5 = torch.randn(1, 256, 20, 20)
+
+    model = FCD(
+        in_channels=(64, 128, 256),
+        out_channels=128,
+    )
+    output = model([p3, p4, p5])
+    print("FCD output:", tuple(output.shape))
