@@ -1,0 +1,385 @@
+"""RSISD-Head for the paper's three-scale YOLOv8 instance segmenter.
+
+Sources:
+  * Manuscript Section 2.2 and Figure 3: EMPC -> 1x1 convolution feeds
+    box and class predictors; two 3x3 convolutions predict mask
+    coefficients; the highest-resolution feature produces mask prototypes.
+  * EF-UODA Section 3.3: EMPC uses four channel groups with 1/3/5/7
+    kernels, followed by a pointwise convolution.
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+
+import torch
+from torch import Tensor, nn
+
+
+class ConvBNAct(nn.Module):
+    """Conv2d -> BatchNorm2d -> SiLU."""
+
+    def __init__(self, c1: int, c2: int, kernel: int = 1) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            c1, c2, kernel, padding=kernel // 2, bias=False
+        )
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.act(self.bn(self.conv(x)))
+
+
+class EMPC(nn.Module):
+    """Efficient Multi-scale Pointwise Convolution.
+
+    The input channels are split into four contiguous groups. The groups
+    pass through 1x1, 3x3, 5x5, and 7x7 convolutions, respectively.
+    A final 1x1 convolution mixes the resulting channels.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        if channels < 4 or channels % 4:
+            raise ValueError(
+                "EMPC channels must be a positive multiple of four"
+            )
+
+        quarter = channels // 4
+        self.branches = nn.ModuleList(
+            ConvBNAct(quarter, quarter, kernel)
+            for kernel in (1, 3, 5, 7)
+        )
+        self.pointwise = ConvBNAct(channels, channels, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        groups = x.chunk(4, dim=1)
+        outputs = [
+            branch(group)
+            for branch, group in zip(self.branches, groups)
+        ]
+        return self.pointwise(torch.cat(outputs, dim=1))
+
+
+class Proto(nn.Module):
+    """YOLOv8 prototype-mask path applied to the P3 feature map."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        npr: int,
+        nm: int,
+    ) -> None:
+        super().__init__()
+        self.cv1 = ConvBNAct(in_channels, npr, 3)
+        self.upsample = nn.ConvTranspose2d(
+            npr, npr, kernel_size=2, stride=2, bias=True
+        )
+        self.cv2 = ConvBNAct(npr, npr, 3)
+        self.cv3 = ConvBNAct(npr, nm, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.cv3(self.cv2(self.upsample(self.cv1(x))))
+
+
+class RSISDHead(nn.Module):
+    """Resource-saving instance-segmentation detection head.
+
+    Args:
+        nc: Number of classes.
+        nm: Number of mask coefficients and prototype channels.
+        npr: Hidden channels in the prototype-mask path.
+        ch: Input channel counts for P3, P4, and P5, in that order.
+        share_across_scales: Whether to share the EMPC stem across scales.
+        hidden_channels: Width of the shared stem, when sharing is enabled.
+        reg_max: Number of DFL bins for each box edge.
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        nm: int = 32,
+        npr: int = 256,
+        ch: Sequence[int] = (),
+        *,
+        share_across_scales: bool = False,
+        hidden_channels: int | None = None,
+        reg_max: int = 16,
+    ) -> None:
+        super().__init__()
+
+        channels = tuple(int(c) for c in ch)
+        if len(channels) != 3 or any(c <= 0 for c in channels):
+            raise ValueError(
+                "ch must contain three positive channel counts "
+                "for P3, P4, and P5"
+            )
+        if nc <= 0 or nm <= 0 or npr <= 0 or reg_max <= 0:
+            raise ValueError(
+                "nc, nm, npr, and reg_max must be positive"
+            )
+
+        self.nc = nc
+        self.nm = nm
+        self.npr = npr
+        self.nl = len(channels)
+        self.reg_max = reg_max
+        self.no = 4 * reg_max + nc
+        self.share_across_scales = share_across_scales
+        self.stride = torch.zeros(self.nl)
+        self.export = False
+
+        if share_across_scales:
+            width = (
+                hidden_channels
+                if hidden_channels is not None
+                else max(64, channels[0])
+            )
+            if width < 4 or width % 4:
+                raise ValueError(
+                    "hidden_channels must be a positive multiple of four"
+                )
+
+            self.adapters = nn.ModuleList(
+                nn.Identity()
+                if c == width
+                else ConvBNAct(c, width, 1)
+                for c in channels
+            )
+            self.shared_stem = nn.Sequential(
+                EMPC(width),
+                ConvBNAct(width, width, 1),
+            )
+            stem_channels = (width,) * self.nl
+        else:
+            if any(c < 4 or c % 4 for c in channels):
+                raise ValueError(
+                    "all input channels must be multiples of four for EMPC"
+                )
+            self.stem = nn.ModuleList(
+                nn.Sequential(
+                    EMPC(c),
+                    ConvBNAct(c, c, 1),
+                )
+                for c in channels
+            )
+            stem_channels = channels
+
+        # Bounding-box distribution and class prediction branches.
+        self.cv2 = nn.ModuleList(
+            nn.Conv2d(c, 4 * reg_max, 1)
+            for c in stem_channels
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Conv2d(c, nc, 1)
+            for c in stem_channels
+        )
+
+        # Mask-coefficient branches remain scale-specific.
+        mask_width = max(channels[0] // 4, nm)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                ConvBNAct(c, mask_width, 3),
+                ConvBNAct(mask_width, mask_width, 3),
+                nn.Conv2d(mask_width, nm, 1),
+            )
+            for c in channels
+        )
+
+        self.proto = Proto(channels[0], npr, nm)
+
+    def bias_init(self) -> None:
+        """Initialize prediction biases after stride is known."""
+        strides = self.stride.tolist()
+        if any(s <= 0 for s in strides):
+            raise ValueError(
+                "set all three positive strides before bias_init()"
+            )
+
+        with torch.no_grad():
+            for box, cls, stride in zip(
+                self.cv2, self.cv3, strides
+            ):
+                box.bias.fill_(1.0)
+                cls.bias.fill_(
+                    math.log(
+                        5 / self.nc / (640 / stride) ** 2
+                    )
+                )
+
+    def _decode(self, raw: list[Tensor]) -> Tensor:
+        """Apply DFL and decode boxes to xywh pixel coordinates."""
+        strides = self.stride.tolist()
+        if any(s <= 0 for s in strides):
+            raise ValueError(
+                "set head.stride to the P3/P4/P5 strides before eval()"
+            )
+
+        batch = raw[0].shape[0]
+        logits = torch.cat(
+            [
+                output.reshape(batch, self.no, -1)
+                for output in raw
+            ],
+            dim=2,
+        )
+        box_logits, cls_logits = logits.split(
+            (4 * self.reg_max, self.nc),
+            dim=1,
+        )
+
+        total_cells = box_logits.shape[-1]
+        bins = torch.arange(
+            self.reg_max,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        distances = (
+            box_logits
+            .reshape(batch, 4, self.reg_max, total_cells)
+            .softmax(dim=2)
+            .mul(bins.view(1, 1, -1, 1))
+            .sum(dim=2)
+        )
+
+        anchor_parts = []
+        stride_parts = []
+
+        for output, stride in zip(raw, strides):
+            height, width = output.shape[-2:]
+            yy, xx = torch.meshgrid(
+                torch.arange(
+                    height,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                ),
+                torch.arange(
+                    width,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                ),
+                indexing="ij",
+            )
+
+            anchor_parts.append(
+                torch.stack(
+                    (xx + 0.5, yy + 0.5),
+                    dim=0,
+                ).reshape(2, -1)
+            )
+            stride_parts.append(
+                torch.full(
+                    (1, height * width),
+                    stride,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+            )
+
+        anchors = torch.cat(
+            anchor_parts, dim=1
+        ).unsqueeze(0)
+        stride_values = torch.cat(
+            stride_parts, dim=1
+        ).unsqueeze(0)
+
+        left_top = distances[:, :2]
+        right_bottom = distances[:, 2:]
+
+        xy = anchors + (right_bottom - left_top) / 2
+        wh = left_top + right_bottom
+        boxes = torch.cat((xy, wh), dim=1) * stride_values
+
+        return torch.cat(
+            (boxes, cls_logits.sigmoid()),
+            dim=1,
+        )
+
+    def forward(self, x: Sequence[Tensor]):
+        if len(x) != self.nl:
+            raise ValueError(
+                f"expected {self.nl} feature maps, got {len(x)}"
+            )
+
+        batch = x[0].shape[0]
+        prototypes = self.proto(x[0])
+
+        mask_coefficients = torch.cat(
+            [
+                branch(feature).reshape(batch, self.nm, -1)
+                for branch, feature in zip(self.cv4, x)
+            ],
+            dim=2,
+        )
+
+        if self.share_across_scales:
+            features = [
+                self.shared_stem(adapter(feature))
+                for adapter, feature in zip(self.adapters, x)
+            ]
+        else:
+            features = [
+                stem(feature)
+                for stem, feature in zip(self.stem, x)
+            ]
+
+        raw = [
+            torch.cat(
+                (box(feature), cls(feature)),
+                dim=1,
+            )
+            for feature, box, cls in zip(
+                features, self.cv2, self.cv3
+            )
+        ]
+
+        if self.training:
+            return raw, mask_coefficients, prototypes
+
+        decoded = torch.cat(
+            (self._decode(raw), mask_coefficients),
+            dim=1,
+        )
+
+        if self.export:
+            return decoded, prototypes
+
+        return decoded, (
+            raw,
+            mask_coefficients,
+            prototypes,
+        )
+
+
+if __name__ == "__main__":
+    features = [
+        torch.randn(1, channels, size, size)
+        for channels, size in (
+            (64, 16),
+            (128, 8),
+            (256, 4),
+        )
+    ]
+
+    head = RSISDHead(
+        nc=3,
+        ch=(64, 128, 256),
+        share_across_scales=False,
+    )
+
+    raw, coefficients, prototypes = head(features)
+    print(
+        "Training output:",
+        [tuple(t.shape) for t in raw],
+        tuple(coefficients.shape),
+        tuple(prototypes.shape),
+    )
+
+    head.stride = torch.tensor([8.0, 16.0, 32.0])
+    head.eval()
+
+    with torch.no_grad():
+        predictions, _ = head(features)
+
+    print("Inference output:", tuple(predictions.shape))
