@@ -1,0 +1,216 @@
+"""Efficient Context Information (ECI) module.
+
+Structure:
+    ECI: 1x1 projection -> channel split -> serial ICO blocks
+         -> concatenate -> 1x1 projection
+
+    ICO: 1x1 channel reduction
+         -> parallel local and dilated depthwise 3x3 convolutions
+         -> concatenate -> BN -> SiLU -> FGlo -> residual addition
+
+    FGlo: global average pooling -> two fully connected layers
+          -> channel-wise multiplication
+
+The implementation follows Section 2.4, Figure 5, and Algorithm 1 of
+the manuscript. The depthwise branches follow the supplied Ultralytics
+repository's ContextGuidedBlock implementation.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+
+__all__ = ["FGlo", "ICO", "ECI", "C2f_ContextGuided"]
+
+
+class ConvBNAct(nn.Module):
+    """1x1 convolution followed by BatchNorm and SiLU."""
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=1, bias=False
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.act(self.bn(self.conv(x)))
+
+
+class FGlo(nn.Module):
+    """Channel-wise global feature refinement."""
+
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        if channels <= 0 or reduction <= 0:
+            raise ValueError("channels and reduction must be positive")
+
+        hidden_channels = max(1, channels // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch, channels, _, _ = x.shape
+        weights = self.avg_pool(x).reshape(batch, channels)
+        weights = self.fc(weights).reshape(batch, channels, 1, 1)
+        return x * weights
+
+
+class ICO(nn.Module):
+    """Information Characterization Optimization block.
+
+    Input and output shapes are both (B, channels, H, W).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        dilation_rate: int = 2,
+        reduction: int = 16,
+    ) -> None:
+        super().__init__()
+
+        if channels < 2 or channels % 2 != 0:
+            raise ValueError("channels must be an even integer >= 2")
+        if dilation_rate < 1:
+            raise ValueError("dilation_rate must be >= 1")
+
+        half_channels = channels // 2
+
+        # Reduce channels before the two parallel context branches.
+        self.conv1x1 = ConvBNAct(channels, half_channels)
+
+        # Local context.
+        self.local_conv = nn.Conv2d(
+            half_channels,
+            half_channels,
+            kernel_size=3,
+            padding=1,
+            groups=half_channels,
+        )
+
+        # Surrounding context with a larger receptive field.
+        self.surrounding_conv = nn.Conv2d(
+            half_channels,
+            half_channels,
+            kernel_size=3,
+            padding=dilation_rate,
+            dilation=dilation_rate,
+            groups=half_channels,
+        )
+
+        self.bn_act = nn.Sequential(
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+        )
+        self.global_refinement = FGlo(channels, reduction)
+
+    def forward(self, x: Tensor) -> Tensor:
+        reduced = self.conv1x1(x)
+        local = self.local_conv(reduced)
+        surrounding = self.surrounding_conv(reduced)
+
+        fused = torch.cat((local, surrounding), dim=1)
+        fused = self.bn_act(fused)
+        fused = self.global_refinement(fused)
+
+        return x + fused
+
+
+class ECI(nn.Module):
+    """Efficient Context Information module with a C2f-style structure.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        n: Number of serial ICO blocks.
+        expansion: Ratio used to calculate hidden channels.
+        dilation_rate: Dilation rate of the surrounding-context branch.
+        reduction: Channel reduction ratio in FGlo.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        n: int = 1,
+        expansion: float = 0.5,
+        dilation_rate: int = 2,
+        reduction: int = 16,
+    ) -> None:
+        super().__init__()
+
+        if in_channels <= 0 or out_channels <= 0:
+            raise ValueError("in_channels and out_channels must be positive")
+        if not isinstance(n, int) or n < 1:
+            raise ValueError("n must be an integer >= 1")
+        if expansion <= 0:
+            raise ValueError("expansion must be positive")
+
+        hidden_channels = int(out_channels * expansion)
+        if hidden_channels < 2 or hidden_channels % 2 != 0:
+            raise ValueError(
+                "int(out_channels * expansion) must be even and >= 2"
+            )
+
+        self.hidden_channels = hidden_channels
+        self.cv1 = ConvBNAct(in_channels, 2 * hidden_channels)
+        self.blocks = nn.ModuleList(
+            ICO(
+                hidden_channels,
+                dilation_rate=dilation_rate,
+                reduction=reduction,
+            )
+            for _ in range(n)
+        )
+        self.cv2 = ConvBNAct(
+            (n + 2) * hidden_channels,
+            out_channels,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        features = list(self.cv1(x).chunk(2, dim=1))
+
+        for block in self.blocks:
+            features.append(block(features[-1]))
+
+        return self.cv2(torch.cat(features, dim=1))
+
+
+class C2f_ContextGuided(ECI):
+    """ECI constructor compatible with the supplied Ultralytics YAML.
+
+    `shortcut` and `g` are accepted for C2f-style configuration
+    compatibility. The ICO block uses its own residual connection.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        shortcut: bool = False,
+        g: int = 1,
+        e: float = 0.5,
+    ) -> None:
+        super().__init__(
+            in_channels=c1,
+            out_channels=c2,
+            n=n,
+            expansion=e,
+        )
+
+
+if __name__ == "__main__":
+    model = ECI(in_channels=128, out_channels=128, n=2)
+    x = torch.randn(1, 128, 80, 80)
+    y = model(x)
+    print("Input shape: ", tuple(x.shape))
+    print("Output shape:", tuple(y.shape))
